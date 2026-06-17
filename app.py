@@ -1,99 +1,123 @@
 import os
+import asyncio
 from flask import Flask, request
-import telebot
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
 
-# Environment variables se token aur admin ID nikalna (Render me configure karenge)
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-ADMIN_ID = int(os.environ.get('ADMIN_ID'))
-
-bot = telebot.TeleBot(BOT_TOKEN)
+# Flask app for Render Web Service Webhook & Self-Ping
 app = Flask(__name__)
 
-# --- BOT LOGIC ---
+# Fetch environment variables safely
+TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = os.getenv("ADMIN_ID")  # Admin ki Telegram Chat ID
 
-# 1. /start command aur Admin Notification
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    user_name = message.from_user.first_name
-    chat_id = message.chat.id
-    
-    # User ko reply
-    bot.reply_to(message, f"Hi {user_name}, kese ho?")
-    
-    # Admin ko notification (Agar start karne wala khud admin nahi hai to)
-    if chat_id != ADMIN_ID:
-        bot.send_message(
-            ADMIN_ID, 
-            f"🔔 *New User Started the Bot!*\n👤 Name: {user_name}\n🆔 ID: {chat_id}", 
-            parse_mode="Markdown"
-        )
+# Initialize Telegram Application (Global)
+ptb_application = None
 
-# 2. Admin Broadcast Command (/broadcast <message>)
-@bot.message_handler(commands=['broadcast'], func=lambda message: message.chat.id == ADMIN_ID)
-def broadcast_message(message):
-    # Command ke baad ka text nikalne ke liye
-    text_to_send = message.text.split(' ', 1)
-    if len(text_to_send) < 2:
-        bot.reply_to(message, "❌ Please write a message. Example: `/broadcast Hello Users`")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/start command handler"""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    
+    # User ko reply dena
+    await update.message.reply_text(f"Hi {user.first_name}, kese ho? 😊")
+    
+    # Admin ko notification bhejna (Agar user khud admin nahi hai toh)
+    if str(chat_id) != str(ADMIN_ID):
+        notification = f"🔔 **New User Started the Bot!**\n👤 Name: {user.first_name}\n🆔 ID: {chat_id}\nUsername: @{user.username if user.username else 'None'}"
+        await context.bot.send_message(chat_id=ADMIN_ID, text=notification, parse_mode="Markdown")
+
+async def handle_user_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User ke message, photo, voice ko Admin tak forward karna, ya Admin ke reply ko user tak bhejna"""
+    chat_id = update.effective_chat.id
+    message = update.message
+
+    # 1. AGAR ADMIN REPLY KAR RAHA HAI (Swipe/Reply feature)
+    if str(chat_id) == str(ADMIN_ID) and message.reply_to_message:
+        reply_text = message.reply_to_message.text or message.reply_to_message.caption
+        if reply_text and "User ID:" in reply_text:
+            try:
+                # Text se Target User ID nikalna
+                target_user_id = reply_text.split("User ID:")[1].strip().split("\n")[0]
+                
+                # Admin ka reply user ko bhejna
+                if message.text:
+                    await context.bot.send_message(chat_id=target_user_id, text=message.text)
+                elif message.photo:
+                    await context.bot.send_photo(chat_id=target_user_id, photo=message.photo[-1].file_id, caption=message.caption)
+                elif message.voice:
+                    await context.bot.send_voice(chat_id=target_user_id, voice=message.voice.file_id, caption=message.caption)
+                
+                await message.reply_text("✅ Reply sent to user!")
+                return
+            except Exception as e:
+                await message.reply_text(f"❌ Failed to send reply: {e}")
+                return
+
+    # 2. AGAR USER NE KUCH BHEJA HAI (Forwarding to Admin)
+    if str(chat_id) != str(ADMIN_ID):
+        user_info = f"\n\nFrom: {update.effective_user.first_name}\nUser ID: {chat_id}"
+        
+        if message.text:
+            await context.bot.send_message(chat_id=ADMIN_ID, text=f"💬 **New Message:**\n{message.text}{user_info}")
+        elif message.photo:
+            await context.bot.send_photo(chat_id=ADMIN_ID, photo=message.photo[-1].file_id, caption=f"📸 **New Photo**{user_info}")
+        elif message.voice:
+            await context.bot.send_voice(chat_id=ADMIN_ID, voice=message.voice.file_id, caption=f"🎙️ **New Voice**{user_info}")
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to send message to all users (stored temporarily or manual list)"""
+    if str(update.effective_chat.id) != str(ADMIN_ID):
         return
-    
-    msg_text = text_to_send[1]
-    bot.reply_to(message, "📢 Broadcasting started...")
-    
-    # Note: Real bots me users ki list database me save hoti hai. 
-    # Yahan hum un sabhi users ko bhej sakte hain jinki chat_id admin ke paas record ho.
-    # Ek baar check kar lein ki aapke paas users ki list kahan saved hai.
 
-# 3. Admin Reply Logic (Admin jab kisi forwarded message par swipe/reply karega)
-@bot.message_handler(func=lambda message: message.chat.id == ADMIN_ID and message.reply_to_message is not None)
-def handle_admin_reply(message):
-    try:
-        # Check karna ki admin ne jis message par reply kiya, kya wo kisi user se forward huye text/photo ka hai
-        reply_to = message.reply_to_message
-        
-        # Forwarded message se user ki ID nikalna
-        if reply_to.forward_from:
-            user_id = reply_to.forward_from.id
-        else:
-            # Agar user ne privacy lagayi hai, to text me se ID dhundni hogi (Backup method)
-            bot.reply_to(message, "❌ User ki privacy setting ki wajah se direct reply nahi ho saka. Unki ID par manually message bhejein.")
-            return
+    # Command format: /broadcast [Your Message]
+    if not context.args:
+        await update.message.reply_text("❌ Format: `/broadcast Hello Users`", parse_mode="Markdown")
+        return
 
-        # Admin ka message user ko bhejna
-        if message.content_type == 'text':
-            bot.send_message(user_id, message.text)
-        elif message.content_type == 'photo':
-            bot.send_photo(user_id, message.photo[-1].file_id, caption=message.caption)
-        elif message.content_type == 'voice':
-            bot.send_voice(user_id, message.voice.file_id)
-        
-        bot.reply_to(message, "✅ Reply sent successfully!")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error: {str(e)}")
+    broadcast_msg = " ".join(context.args)
+    await update.message.reply_text("⚠️ Broadcast feature linked! (Note: Real-time broadcast requires a database. To broadcast manually right now, you can reply directly to active users.)")
 
-# 4. User Messages (Text, Photo, Voice) Admin ko Forward karna
-@bot.message_handler(content_types=['text', 'photo', 'voice'], func=lambda message: message.chat.id != ADMIN_ID)
-def forward_to_admin(message):
-    # Isse admin ko pata chalega kisne bheja hai aur admin 'Reply' (Swipe) kar sakega
-    bot.forward_message(ADMIN_ID, message.chat.id, message.message_id)
+# Flask Routes for Render Hook
+@app.route("/", methods=["GET"])
+def home():
+    return "Bot is running online 24/7!", 200
 
-
-# --- FLASK WEB SERVER & WEBHOOK ---
-
-@app.route('/' + BOT_TOKEN, methods=['POST'])
-def getMessage():
-    json_string = request.get_data().decode('utf-8')
-    update = telebot.types.Update.de_json(json_string)
-    bot.process_new_updates([update])
-    return "!", 200
-
-@app.route("/")
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    bot.remove_webhook()
-    # RENDER_EXTERNAL_URL Render khud provide karta hai environment me
-    server_url = os.environ.get('RENDER_EXTERNAL_URL') 
-    bot.set_webhook(url=server_url + '/' + BOT_TOKEN)
-    return "Bot is Running!", 200
+    """Telegram Webhook route to receive updates"""
+    if ptb_application:
+        asyncio.run(ptb_application.update_queue.put(Update.de_json(request.get_json(force=True), ptb_application.bot)))
+    return "OK", 200
+
+def main():
+    global ptb_application
+    
+    # Initialize python-telegram-bot Application
+    ptb_application = Application.builder().token(TOKEN).build()
+
+    # Handlers register karna
+    ptb_application.add_handler(CommandHandler("start", start))
+    ptb_application.add_handler(CommandHandler("broadcast", broadcast))
+    ptb_application.add_handler(filters=filters.TEXT | filters.PHOTO | filters.VOICE, callback=handle_user_messages)
+
+    # Webhook set karna Telegram par
+    RENDER_URL = os.getenv("RENDER_EXTERNAL_URL") # Render yeh URL khud deta hai
+    if RENDER_URL:
+        asyncio.run(ptb_application.bot.set_webhook(url=f"{RENDER_URL}/webhook"))
+        print(f"Webhook set successfully on: {RENDER_URL}")
+
+    # Start python-telegram-bot application backend
+    asyncio.run(ptb_application.initialize())
+    asyncio.run(ptb_application.start())
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get('PORT', 5000)))
+    main()
+    # Run Flask server on port 10000 (Render default)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
